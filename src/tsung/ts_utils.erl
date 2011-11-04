@@ -427,6 +427,7 @@ to_https({request, {body,Data}}) when is_list(Data) ->
     %% body request, no headers
     re:replace(Data,"http://-","https://",[global]);
 to_https({request, S="CONNECT"++Rest}) -> {ok,S};
+to_https({request, []}) -> {ok, []};
 to_https({request, String}) when is_list(String) ->
     EndOfHeader = string:str(String, "\r\n\r\n"),
     Header = string:substr(String, 1, EndOfHeader - 1) ++ "\r\n",
@@ -440,7 +441,9 @@ to_https({request, String}) when is_list(String) ->
     {ok, RealString}.
 
 
-%% @spec from_https(string()) -> {ok, String::string() | Data::iodata}
+%% @spec from_https(string()) -> {ok, string() | iodata()}
+%% @doc replace https links with 'http://-'
+%% @end
 from_https(String) when is_list(String)->
     ReOpts=[{newline,crlf},multiline,global,caseless],
     %% remove Secure from Set-Cookie (TSUN-120)
