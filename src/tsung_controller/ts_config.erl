@@ -102,12 +102,7 @@ parse(Element = #xmlElement{parents = [], attributes=Attrs}, Conf=#config{}) ->
 parse(Element = #xmlElement{name=server, attributes=Attrs}, Conf=#config{servers=ServerList}) ->
     Server = getAttr(Attrs, host),
     Port   = getAttr(integer, Attrs, port),
-    Type = case getAttr(Attrs, type) of
-               "ssl" -> ssl;
-               "tcp" -> gen_tcp;
-               "udp" -> gen_udp;
-               "erlang" -> erlang
-           end,
+    Type   = set_net_type(getAttr(Attrs, type)),
 
     lists:foldl(fun parse/2,
         Conf#config{servers = [#server{host=Server,
@@ -115,6 +110,8 @@ parse(Element = #xmlElement{name=server, attributes=Attrs}, Conf=#config{servers
                                        type=Type
                                      }|ServerList]},
         Element#xmlElement.content);
+
+
 
 %% Parsing the cluster monitoring element (monitor)
 parse(Element = #xmlElement{name=monitor, attributes=Attrs},
@@ -133,11 +130,13 @@ parse(Element = #xmlElement{name=monitor, attributes=Attrs},
                                                          community, ?config(snmp_community)),
                            Version = getAttr(atom,SnmpEl#xmlElement.attributes,
                                                        version, ?config(snmp_version)),
-                           {snmp, {Port, Community, Version}};
+                           %% parse OIDS def
+                           TmpConf = lists:foldl(fun parse/2, Conf#config{oids=[]}, SnmpEl#xmlElement.content),
+                           {snmp, {Port, Community, Version,TmpConf#config.oids}};
                        _ ->
                            {snmp, {?config(snmp_port),
-                            ?config(snmp_community),
-                            ?config(snmp_version)}}
+                                   ?config(snmp_community),
+                                   ?config(snmp_version),[]}}
                    end;
                munin ->
                    case lists:keysearch(munin,#xmlElement.name,
@@ -160,6 +159,21 @@ parse(Element = #xmlElement{name=monitor, attributes=Attrs},
     lists:foldl(fun parse/2,
         Conf#config{monitor_hosts = lists:append(MHList, NewMon)},
         Element#xmlElement.content);
+
+
+parse(#xmlElement{name=oid, attributes=Attrs}, Conf=#config{oids=OIDS}) ->
+    OIDStr  = getAttr(Attrs, value),
+    OID  = lists:map(fun erlang:list_to_integer/1, string:tokens(OIDStr,".")),
+    Name = getAttr(atom, Attrs, name),
+    Type = case getAttr(atom, Attrs, type, sample) of
+               sample  -> sample;
+               counter -> sample_counter;
+               sum     -> sum
+           end,
+    Snippet = getAttr(string, Attrs, eval, "fun(X)-> X end."),
+    Fun= ts_utils:eval(Snippet),
+    true = is_function(Fun, 1),
+    Conf#config{oids=[{OID,Name,Type,Fun}| OIDS]};
 
 %%
 parse(Element = #xmlElement{name=load, attributes=Attrs}, Conf) ->
@@ -254,7 +268,12 @@ parse(Element = #xmlElement{name=ip, attributes=Attrs},
                                      StrIP
                              end,
                  ?LOGF("resolving host ~p~n",[ToResolve],?WARN),
-                 {ok,IPtmp} = inet:getaddr(ToResolve,inet),
+                 {ok,IPtmp} = case inet:getaddr(ToResolve,inet) of
+                                  {error,nxdomain} -> % retry with IPv6
+                                      inet:getaddr(ToResolve,inet6);
+                                  Val ->
+                                      Val
+                              end,
                  IPtmp
          end,
     ?LOGF("resolved host ~p~n",[IP],?WARN),
@@ -338,8 +357,10 @@ parse(Element = #xmlElement{name=session, attributes=Attrs},
     Bidi        = getAttr(atom,Attrs, bidi, Bidi_def),
     Name        = getAttr(Attrs, name),
     ?LOGF("Session name for id ~p is ~p~n",[Id+1, Name],?NOTICE),
-    ?LOGF("Session type: persistent=~p, bidi=~p~n",[Persistent,Bidi],?NOTICE),
-    Probability = getAttr(float_or_integer, Attrs, probability),
+    ?LOGF("Session type: persistent=~p, bidi=~p~n",[Persistent,Bidi],?INFO),
+    Probability = getAttr(float_or_integer, Attrs, probability, -1),
+    Weight      = getAttr(float_or_integer, Attrs, weight, -1),
+    {Popularity, NewUseWeights, NewTotal} = get_popularity(Probability, Weight, Conf#config.use_weights,Conf#config.total_popularity),
     NewSList = case SList of
                    [] -> []; % first session
                    [Previous|Tail] ->
@@ -348,7 +369,7 @@ parse(Element = #xmlElement{name=session, attributes=Attrs},
                end,
     lists:foldl(fun parse/2,
                 Conf#config{sessions = [#session{id           = Id + 1,
-                                                 popularity   = Probability,
+                                                 popularity   = Popularity,
                                                  type         = Type,
                                                  name         = Name,
                                                  persistent   = Persistent,
@@ -359,6 +380,8 @@ parse(Element = #xmlElement{name=session, attributes=Attrs},
                                                 }
                                         |NewSList],
                             main_sess_type = Type,
+                            use_weights=NewUseWeights,
+                            total_popularity=NewTotal,
                             curid=0, cur_req_id=0},% re-initialize request id
                 Element#xmlElement.content);
 
@@ -384,7 +407,7 @@ parse(Element = #xmlElement{name=transaction, attributes=Attrs},
 %%%% Parsing the 'if' element
 parse(_Element = #xmlElement{name='if', attributes=Attrs,content=Content},
       Conf = #config{session_tab = Tab, sessions=[CurS|_], curid=Id}) ->
-    VarName = getAttr(atom,Attrs,var),
+    VarName=get_dynvar_name(getAttr(string,Attrs,var)),
     {Rel,Value} = case getAttr(string,Attrs,eq,none) of
                 none -> {neq,getAttr(string,Attrs,neq)};
                 X ->  {eq,X}
@@ -394,7 +417,7 @@ parse(_Element = #xmlElement{name='if', attributes=Attrs,content=Content},
     NewConf = lists:foldl(fun parse/2, Conf#config{curid=Id+1}, Content),
     NewId = NewConf#config.curid,
     ?LOGF("endif in session ~p as id ~p",[CurS#session.id,NewId+1],?INFO),
-    InitialAction = {ctrl_struct, {if_start, Rel, VarName, Value , NewId+1}},
+    InitialAction = {ctrl_struct, {if_start, Rel, VarName, list_to_binary(Value) , NewId+1}},
     %%NewId+1 -> id of the first action after the if
     ets:insert(Tab,{{CurS#session.id,Id+1},InitialAction}),
     NewConf;
@@ -458,7 +481,8 @@ parse(_Element = #xmlElement{name=foreach, attributes=Attrs,content=Content},
 parse(_Element = #xmlElement{name=repeat,attributes=Attrs,content=Content},
     Conf = #config{session_tab = Tab, sessions=[CurS|_], curid=Id}) ->
     MaxRepeat = getAttr(integer,Attrs,max_repeat,20),
-    RepeatName = getAttr(atom,Attrs,name),
+    RepeatName = get_dynvar_name(getAttr(string,Attrs,name)),
+
     [LastElement|_] = lists:reverse([E || E=#xmlElement{} <- Content]),
     case LastElement of
         #xmlElement{name=While,attributes=WhileAttrs}
@@ -471,7 +495,7 @@ parse(_Element = #xmlElement{name=repeat,attributes=Attrs,content=Content},
             Var = getAttr(atom,WhileAttrs,var),
             NewConf = lists:foldl(fun parse/2, Conf#config{curid=Id}, Content),
             NewId = NewConf#config.curid,
-            EndAction = {ctrl_struct,{repeat,RepeatName, While,Rel,Var,Value,Id+1, MaxRepeat}},
+            EndAction = {ctrl_struct,{repeat,RepeatName, While,Rel,Var,list_to_binary(Value),Id+1, MaxRepeat}},
                                  %Id+1 -> id of the first action inside the loop
             ?LOGF("Add repeat action in session ~p as id ~p, Jump to: ~p",
                   [CurS#session.id,NewId+1,Id+1],?INFO),
@@ -486,31 +510,29 @@ parse(#xmlElement{name=dyn_variable, attributes=Attrs},
       Conf=#config{sessions=[CurS|_],dynvar=DynVars}) ->
     StrName  = ts_utils:clean_str(getAttr(Attrs, name)),
     {ok, [{atom,1,Name}],1} = erl_scan:string("'"++StrName++"'"),
-    {Type,Expr} = case {getAttr(string,Attrs,regexp,none),
-                        getAttr(string,Attrs,re,none),
+    {Type,Expr} = case {getAttr(string,Attrs,re,none),
                         getAttr(string,Attrs,pgsql_expr,none),
                         getAttr(string,Attrs,xpath,none),
+                        getAttr(string,Attrs,header,none),
                        getAttr(string,Attrs,jsonpath,none)} of
                       {none,none,none,none,none} ->
                           DefaultRegExp = ?DEF_RE_DYNVAR_BEGIN ++ StrName
                               ++?DEF_RE_DYNVAR_END,
                           {re,DefaultRegExp};
-                      {none,none,none,XPath,none} ->
-                          {xpath,XPath};
-                      {none,none,none,none,JSONPath} ->
-                          {jsonpath,JSONPath};
-                      {none,none,PG,none,none} ->
-                          {pgsql_expr,PG};
-                      {none,RE,none,none,none} ->
+                      {RE,none,none,none, none} ->
                           {re,RE};
-                      {RegExp,_,_,_,_} ->
-                          {regexp,RegExp}
+                      {none,PG,none,none, none} ->
+                          {pgsql_expr,PG};
+                      {none,none,XPath,none,none} ->
+                          {xpath,XPath};
+                      {none,none,none,AuthHeader,none} ->
+                          {header, AuthHeader};
+                      {none,none,none,none,JSONPath} ->
+                          {jsonpath,JSONPath}
                   end,
     FlattenExpr =lists:flatten(Expr),
     %% precompilation of the exp
     DynVar = case Type of
-                 regexp ->
-                     exit({error, regexp_obsolete_use_re});
                  re ->
                      ?LOGF("Add new re: ~s ~n", [Expr],?INFO),
                      {ok, CompiledRegExp} = re:compile(FlattenExpr),
@@ -536,12 +558,7 @@ parse( #xmlElement{name=change_type, attributes=Attrs},
     Port    = getAttr(integer, Attrs, port),
     Store   = getAttr(atom, Attrs, store, false),
     Restore = getAttr(atom, Attrs, restore, false),
-    PType = case getAttr(Attrs, server_type) of
-               "ssl" -> ssl;
-               "tcp" -> gen_tcp;
-               "udp" -> gen_udp;
-               "erlang" -> erlang
-           end,
+    PType   = set_net_type(getAttr(Attrs, server_type)),
     SessType=case Conf#config.main_sess_type == CType of
                  false -> CurS#session.type;
                  true  -> CType % back to the main type
@@ -551,6 +568,17 @@ parse( #xmlElement{name=change_type, attributes=Attrs},
     Conf#config{main_sess_type=SessType, curid=Id+1,
                 sessions=[CurS#session{type=CType}|Other] };
 
+
+parse( #xmlElement{name=interaction, attributes=Attrs},
+      Conf = #config{sessions=[CurS|_Other], curid=Id,session_tab = Tab}) ->
+
+    Action   = list_to_atom(getAttr(string, Attrs, action, "send")),
+    RawId = getAttr(Attrs, id),
+    {ok, [{atom,1,IdInteraction}],1} = erl_scan:string("tr_"++RawId),
+
+    ets:insert(Tab,{{CurS#session.id, Id+1}, {interaction, Action, IdInteraction}}),
+    ?LOGF("Parse  interaction  ~p:~p ~n",[Action,Id],?NOTICE),
+    Conf#config{curid=Id+1 };
 
 parse( Element = #xmlElement{name=set_option, attributes=Attrs},
       Conf = #config{sessions=[CurS|_Other], curid=Id,session_tab = Tab}) ->
@@ -691,16 +719,22 @@ parse(Element = #xmlElement{name=option, attributes=Attrs},
                     NewProto =  OldProto#proto_opts{udp_snd_size=Size},
                     lists:foldl( fun parse/2, Conf#config{proto_opts=NewProto},
                                  Element#xmlElement.content);
-                "tcp_timeout" ->
-                    Size = getAttr(integer,Attrs, value, ?config(tcp_timeout)),
+                "idle_timeout" ->
+                    Timeout = getAttr(integer,Attrs, value, ?config(idle_timeout)),
                     OldProto =  Conf#config.proto_opts,
-                    NewProto =  OldProto#proto_opts{idle_timeout=Size},
+                    NewProto =  OldProto#proto_opts{idle_timeout=Timeout},
+                    lists:foldl( fun parse/2, Conf#config{proto_opts=NewProto},
+                                 Element#xmlElement.content);
+                "global_ack_timeout" ->
+                    Timeout = getAttr(integer,Attrs, value, ?config(global_ack_timeout)),
+                    OldProto =  Conf#config.proto_opts,
+                    NewProto =  OldProto#proto_opts{global_ack_timeout=Timeout},
                     lists:foldl( fun parse/2, Conf#config{proto_opts=NewProto},
                                  Element#xmlElement.content);
                 "retry_timeout" ->
-                    Size = getAttr(integer,Attrs, value, ?config(client_retry_timeout)),
+                    Timeout = getAttr(integer,Attrs, value, ?config(client_retry_timeout)),
                     OldProto =  Conf#config.proto_opts,
-                    NewProto =  OldProto#proto_opts{retry_timeout=Size},
+                    NewProto =  OldProto#proto_opts{retry_timeout=Timeout},
                     lists:foldl( fun parse/2, Conf#config{proto_opts=NewProto},
                                  Element#xmlElement.content);
                 "file_server" ->
@@ -791,7 +825,7 @@ parse(Element = #xmlElement{name=setdynvars, attributes=Attrs},
                      FileId = getAttr(atom,Attrs,fileid,none),
                      case lists:keysearch(FileId,1,Conf#config.file_server) of
                          {value,_Val} ->
-                             Delimiter = getAttr(string,Attrs,delimiter,";"),
+                             Delimiter = list_to_binary(getAttr(string,Attrs,delimiter,";")),
                              {setdynvars,file,{Order,FileId,Delimiter},Vars};
                          false ->
                              io:format(standard_error, "Unknown_file_id ~p in file setdynvars declaration: you forgot to add a file_server option~n",[FileId]),
@@ -810,7 +844,9 @@ parse(Element = #xmlElement{name=setdynvars, attributes=Attrs},
                  "jsonpath" ->
                      From = getAttr(atom, Attrs,from),
                      JSONPath = getAttr(Attrs,jsonpath),
-                     {setdynvars,jsonpath,{JSONPath, From},Vars}
+                     {setdynvars,jsonpath,{JSONPath, From},Vars};
+                 "server" ->
+                     {setdynvars,server,{},Vars}
              end,
     ?LOGF("Add setdynvars in session ~p as id ~p",[CurS#session.id,Id+1],?INFO),
     ets:insert(Tab, {{CurS#session.id, Id+1}, Action}),
@@ -979,3 +1015,41 @@ read_stdio(eof, Data)->
 read_stdio(Data,Acc) ->
     read_stdio(io:get_line(""),[Acc,Data]).
 
+set_net_type("tcp")   -> ts_tcp;
+set_net_type("tcp6")  -> ts_tcp6;
+set_net_type("udp")   -> ts_udp;
+set_net_type("udp6")  -> ts_udp6;
+set_net_type("ssl")   -> ts_ssl;
+set_net_type("ssl6")  -> ts_ssl6;
+set_net_type("websocket")  -> ts_websocket;
+set_net_type("bosh")  -> ts_bosh;
+set_net_type("bosh_ssl") -> ts_bosh_ssl;
+set_net_type("erlang") -> erlang.
+
+get_dynvar_name(VarNameStr) ->
+    %% check if the var name is for an array (myvar[N])
+    case re:run(VarNameStr,"(.+)\[(\d+)\]",[{capture,all_but_first,list},dotall]) of
+        {match,[Name,Index]} -> {list_to_atom(Name),Index};
+        _                    -> list_to_atom(VarNameStr)
+    end.
+
+
+%% @spec get_popularity(Proba::number(),Weight::number(),UseWeight:true|false|undefined, Total::number()) ->
+%%   {Value::number(), UseWeight:boolean(),  Total:: number()}
+%% check if we are using popularity or weights; keep the total up to date.
+get_popularity(-1, -1, _, _)->
+    erlang:error({"must set weight or probability in session"});
+get_popularity(Proba,Weight,_,_) when is_number(Proba), Proba >= 0, is_number(Weight), Weight >= 0 ->
+    erlang:error({"can't mix probabilites and weights", Proba, Weight} );
+get_popularity(Proba, _Weight, true,_)     when is_number(Proba), Proba >= 0->
+    erlang:error({"can't use probability when using weight"});
+get_popularity(_, Weight, false,_)        when is_number(Weight), Weight >= 0->
+    erlang:error({"can't use weights when using probabilities"});
+get_popularity(_, Weight, undefined,_)    when is_number(Weight), Weight >= 0 ->
+    {Weight, true, Weight};
+get_popularity(Proba, _, undefined,Total) when is_number(Proba) ->
+    {Proba, false, Proba+Total};
+get_popularity(Proba, _, false,Total) when is_number(Proba) ->
+    {Proba, false, Proba+Total};
+get_popularity(_, Weight, true, Total)    when is_number(Weight) ->
+    {Weight, true, Weight+Total}.

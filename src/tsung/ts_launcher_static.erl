@@ -27,6 +27,7 @@
 -author('nicolas.niclausse@niclux.org').
 
 -include("ts_profile.hrl").
+-include("ts_config.hrl").
 
 -behaviour(gen_fsm). %% a primitive gen_fsm with two state: launcher and wait
 
@@ -87,7 +88,6 @@ stop(Node) ->
 %%          {stop, StopReason}
 %%----------------------------------------------------------------------
 init([]) ->
-    ts_utils:init_seed(),
     {ok, MyHostName} = ts_utils:node_to_hostname(node()),
     ts_launcher_mgr:alive(static),
     {ok, wait, #state{myhostname=MyHostName}}.
@@ -123,7 +123,7 @@ wait({stop}, State) ->
     {stop, normal, State}.
 
 launcher(timeout, State=#state{ users = [{OldWait,Session}|Users]}) ->
-    BeforeLaunch = now(),
+    BeforeLaunch = ?NOW,
     ?LOGF("Launch static user using session ~p ~n", [Session],?DEB),
     do_launch({Session,State#state.myhostname}),
     Wait = set_waiting_time(BeforeLaunch, Users, OldWait),
@@ -138,7 +138,7 @@ launcher(timeout, State=#state{ users = [{OldWait,Session}|Users]}) ->
 
 set_waiting_time(_Before, []        , _Previous) -> 0; % last user
 set_waiting_time(Before , [{Next,_}|_], Previous)  ->
-    LaunchDuration = ts_utils:elapsed(now(), Before),
+    LaunchDuration = ts_utils:elapsed(?NOW, Before),
     %% to keep the rate of new users as expected, remove the time to
     %% launch a client to the next wait.
     NewWait = Next - Previous - LaunchDuration,
@@ -205,8 +205,8 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%%----------------------------------------------------------------------
 do_launch({ Session, MyHostName})->
     case catch ts_config_server:get_user_param(MyHostName) of
-        {ok, {IPParam, Server, UserId, Dump}} ->
-            ts_client_sup:start_child({Session, IPParam, Server, UserId, Dump}),
+        {ok, {IPParam, Server, UserId, Dump, Seed}} ->
+            ts_client_sup:start_child(Session#session{client_ip=IPParam,server=Server,userid=UserId, dump=Dump,seed=Seed}),
             ok;
         Error ->
             ?LOGF("get_next_session failed [~p], skip this session !~n", [Error],?ERR),

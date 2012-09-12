@@ -35,7 +35,6 @@
 
 -behaviour(gen_server).
 
--include("ts_profile.hrl").
 -include("ts_config.hrl").
 
 %% External exports, API
@@ -70,11 +69,11 @@
 %% @doc Start the monitoring process
 %%----------------------------------------------------------------------
 start(Id) ->
-    ?LOGF("starting ~p stats server, global ~n",[Id],?NOTICE),
+    ?LOGF("starting ~p stats server, global ~n",[Id],?INFO),
     gen_server:start_link({global, Id}, ?MODULE, [Id], []).
 
 start() ->
-    ?LOG("starting stats server, global ~n",?NOTICE),
+    ?LOG("starting stats server, global ~n",?INFO),
     gen_server:start_link({global, ?MODULE}, ?MODULE, [?MODULE], []).
 
 stop(Id) ->
@@ -120,7 +119,7 @@ set_output(BackEnd,Stream,Id) ->
 %%----------------------------------------------------------------------
 %% single type of data: don't need a dict, a simple list can store the data
 init([Type]) when Type == 'connect'; Type == 'page'; Type == 'request' ->
-    ?LOGF("starting dedicated stats server for ~p ~n",[Type],?NOTICE),
+    ?LOGF("starting dedicated stats server for ~p ~n",[Type],?INFO),
     Stats = [0,0,0,0,0,0,0,0],
     {ok, #state{ dump_interval = ?config(dumpstats_interval),
                  stats     = Stats,
@@ -129,7 +128,7 @@ init([Type]) when Type == 'connect'; Type == 'page'; Type == 'request' ->
                 }};
 %% id = transaction or ?MODULE: it can handle several types of stats, must use a dict.
 init([Id]) ->
-    ?LOGF("starting ~p stats server~n",[Id],?NOTICE),
+    ?LOGF("starting ~p stats server~n",[Id],?INFO),
     Tab = dict:new(),
     {ok, #state{ dump_interval = ?config(dumpstats_interval),
                  stats   = Tab,
@@ -223,7 +222,7 @@ handle_info(_Info, State) ->
 %% Returns: any (ignored by gen_server)
 %%----------------------------------------------------------------------
 terminate(Reason, State) ->
-    ?LOGF("stoping stats monitor (~p)~n",[Reason],?NOTICE),
+    ?LOGF("stopping stats monitor (~p)~n",[Reason],?INFO),
     export_stats(State),
     ok.
 
@@ -281,10 +280,10 @@ print_stats({_,_,_}, 0, {Backend,0, Logfile})-> % no data yet
 print_stats({{Name,Node},Type},Value,{json,Res,Log}) when (Type =:= sample) orelse (Type =:= sample_counter) ->
     [_,Host] = string:tokens(Node,"@"),
     print_stats_txt({Name,Type,", {\"name\": \"~p\", \"hostname\": \"" ++ Host
-                     ++"\", \"value\": ~p, \"mean\": ~p,\"stdvar\": ~p,\"max\": ~p,\"min\": ~p ,\"global_mean\": ~p ,\"global_count\": ~p}"},Value,{json,Res,Log});
+                     ++"\", \"value\": ~p, \"mean\": ~p,\"stddev\": ~p,\"max\": ~p,\"min\": ~p ,\"global_mean\": ~p ,\"global_count\": ~p}"},Value,{json,Res,Log});
 
 print_stats({Name,Type},Value,{json,Res,Log}) when (Type =:= sample) orelse (Type =:= sample_counter) ->
-    print_stats_txt({Name,Type,", {\"name\": \"~p\", \"value\": ~p, \"mean\": ~p,\"stdvar\": ~p,\"max\":  ~p,\"min\": ~p ,\"global_mean\": ~p ,\"global_count\": ~p}"},Value,{json,Res,Log});
+    print_stats_txt({Name,Type,", {\"name\": \"~p\", \"value\": ~p, \"mean\": ~p,\"stddev\": ~p,\"max\":  ~p,\"min\": ~p ,\"global_mean\": ~p ,\"global_count\": ~p}"},Value,{json,Res,Log});
 
 print_stats({Name,Type},Value,Other) when Type =:= sample orelse Type =:= sample_counter ->
     print_stats_txt({Name,Type,"stats: ~p ~p ~p ~p ~p ~p ~p ~p~n"},Value,Other);
@@ -307,9 +306,9 @@ print_stats_txt({Name,_,Format}, [Mean,0,Max,Min,Count,MeanFB,CountFB|_], {Backe
               [Name, Count, Mean, 0, Max, Min,MeanFB,CountFB ]),
     {Backend,LastRes, Logfile};
 print_stats_txt({Name,_,Format},[Mean,Var,Max,Min,Count,MeanFB,CountFB|_],{Backend,LastRes,Logfile})->
-    StdVar = math:sqrt(Var/Count),
+    StdDev = math:sqrt(Var/Count),
     io:format(Logfile, Format,
-              [Name, Count, Mean, StdVar, Max, Min, MeanFB,CountFB]),
+              [Name, Count, Mean, StdDev, Max, Min, MeanFB,CountFB]),
     {Backend,LastRes, Logfile};
 print_stats_txt({Name, _,Format}, [Value,Last], {Backend,LastRes, Logfile}) ->
     io:format(Logfile, Format, [Name, Value, Last ]),

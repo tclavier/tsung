@@ -16,6 +16,20 @@
 
 test()->
     ok.
+
+popularity_test() ->
+    ?assertError({"can't mix probabilites and weights",10,10}, ts_config:get_popularity(10,10,undefined,100)),
+    ?assertError({"can't use probability when using weight"}, ts_config:get_popularity(10,-1,true,100)),
+    ?assertError({"can't use weights when using probabilities"}, ts_config:get_popularity(-1,10,false,100)),
+    ?assertEqual({10,false,110}, ts_config:get_popularity(10,-1,false,100)),
+    ?assertEqual({10,true,110}, ts_config:get_popularity(-1,10,true,100)),
+    ?assertEqual({30,false,60}, ts_config:get_popularity(30,-1,false,30)),
+    ?assertError({"must set weight or probability in session"} , ts_config:get_popularity(-1,-1,undefined,100)),
+    ?assertError({"can't mix probabilites and weights",0,0}, ts_config:get_popularity(0,0,true,100)),
+    ?assertError({"can't mix probabilites and weights",0,0}, ts_config:get_popularity(0,0,false,100)),
+    ?assertEqual({0,true,100}, ts_config:get_popularity(-1,0,true,100)),
+    ?assertEqual({0,false,100}, ts_config:get_popularity(0,-1,false,100)).
+
 read_config_http_test() ->
     myset_env(),
     ?assertMatch({ok, Config}, ts_config:read("./examples/http_simple.xml",".")).
@@ -45,12 +59,12 @@ config_get_session_test() ->
     ts_user_server:start([]),
     ts_config_server:start_link(["/tmp"]),
     ok = ts_config_server:read_config("./examples/http_setdynvars.xml"),
-    {ok, {Session,IP,Server,1,full} }  = ts_config_server:get_next_session("localhost"),
+    {ok, Session=#session{userid=1,dump=full} }  = ts_config_server:get_next_session("localhost"),
     ?assertEqual(1, Session#session.id).
 
 config_get_session_size_test() ->
     myset_env(),
-    {ok, {Session,IP,Server,2,_} }  = ts_config_server:get_next_session("localhost"),
+    {ok, Session=#session{userid=2} }  = ts_config_server:get_next_session("localhost"),
     ?assertEqual(13, Session#session.size).
 
 
@@ -58,7 +72,7 @@ read_config_badpop_test() ->
     myset_env(),
     ts_user_server:start([]),
     {ok, Config} = ts_config:read("./src/test/badpop.xml","."),
-    ?assertMatch({error,[{error,{bad_sum,_,_}}]}, ts_config_server:check_config(Config)).
+    ?assertMatch({error,{bad_sum,_,_}}, ts_config_server:check_config(Config)).
 
 
 read_config_thinkfirst_test() ->
@@ -68,13 +82,13 @@ read_config_thinkfirst_test() ->
 
 config_minmax_test() ->
     myset_env(),
-    {ok, {Session,IP,Server,3,_} }  = ts_config_server:get_next_session("localhost"),
+    {ok, Session=#session{userid=3} }  = ts_config_server:get_next_session("localhost"),
     Id = Session#session.id,
     ?assertMatch({thinktime,{range,2000,4000}}, ts_config_server:get_req(Id,7)).
 
 config_minmax2_test() ->
     myset_env(),
-    {ok, {Session,IP,Server,4,_} }  = ts_config_server:get_next_session("localhost"),
+    {ok, Session=#session{userid=4} }  = ts_config_server:get_next_session("localhost"),
     Id = Session#session.id,
     {thinktime, Req} = ts_config_server:get_req(Id,7),
     Think=ts_client:set_thinktime(Req),
@@ -86,7 +100,7 @@ config_minmax2_test() ->
 config_thinktime_test() ->
     myset_env(),
     ok = ts_config_server:read_config("./examples/thinks.xml"),
-    {ok, {Session,IP,Server,5,_} }  = ts_config_server:get_next_session("localhost"),
+    {ok, Session=#session{userid=5} }  = ts_config_server:get_next_session("localhost"),
     Id = Session#session.id,
     {thinktime, Req=2000} = ts_config_server:get_req(Id,5),
     {thinktime, 2000} = ts_config_server:get_req(Id,7),
@@ -100,7 +114,7 @@ config_thinktime_test() ->
 config_thinktime2_test() ->
     myset_env(),
     ok = ts_config_server:read_config("./examples/thinks2.xml"),
-    {ok, {Session,{IP,0},Server,6,none} }  = ts_config_server:get_next_session("localhost"),
+    {ok, Session=#session{userid=6} }  = ts_config_server:get_next_session("localhost"),
     Id = Session#session.id,
     {thinktime, Req} = ts_config_server:get_req(Id,5),
     Ref=ts_client:set_thinktime(Req),

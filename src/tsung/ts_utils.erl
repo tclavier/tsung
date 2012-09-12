@@ -26,7 +26,7 @@
 -vc('$Id$ ').
 -author('nicolas.niclausse@niclux.org').
 
--include("ts_profile.hrl").
+-include("ts_macros.hrl").
 
 %% to get file_info record definition
 -include_lib("kernel/include/file.hrl").
@@ -34,7 +34,7 @@
 %% user interface
 -export([debug/3, debug/4, get_val/1, init_seed/0, chop/1, elapsed/2,
          now_sec/0, node_to_hostname/1, add_time/2, keyumerge/3, key1search/2,
-         level2int/1, mkey1search/2, close_socket/2, datestr/0, datestr/1,
+         level2int/1, mkey1search/2, datestr/0, datestr/1,
          erl_system_args/0, erl_system_args/1, setsubdir/1, export_text/1,
          foreach_parallel/2, spawn_par/3, inet_setopts/3, resolve/2,
          stop_all/2, stop_all/3, stop_all/4, join/2, split/2, split2/2, split2/3,
@@ -43,7 +43,8 @@
          decode_base64/1, encode_base64/1, to_lower/1, release_is_newer_or_eq/1,
          randomstr/1,urandomstr/1,urandomstr_noflat/1, eval/1, list_to_number/1,
          time2sec/1, time2sec_hires/1, read_file_raw/1, init_seed/1, jsonpath/2, pmap/2,
-         concat_atoms/1, ceiling/1, accept_loop/3, append_to_filename/3, splitchar/2
+         concat_atoms/1, ceiling/1, accept_loop/3, append_to_filename/3, splitchar/2,
+         randombinstr/1,urandombinstr/1
         ]).
 
 level2int("debug")     -> ?DEB;
@@ -61,6 +62,8 @@ level2int("emergency") -> ?EMERG.
 -define(LT,"&lt;").
 -define(DUPSTR_SIZE,20).
 -define(DUPSTR,"qxvmvtglimieyhemzlxc").
+-define(DUPBINSTR_SIZE,20).
+-define(DUPBINSTR,<<"qxvmvtglimieyhemzlxc">>).
 
 %%----------------------------------------------------------------------
 %% Func: get_val/1
@@ -117,7 +120,11 @@ debug(From, Message, Args, Level) ->
 elapsed({Before1, Before2, Before3}, {After1, After2, After3}) ->
     After  = After1  * 1000000000  + After2  * 1000 + After3/1000,
     Before = Before1 * 1000000000  + Before2 * 1000 + Before3/1000,
-    After - Before.
+    case After - Before of
+        Neg when Neg < 0 -> % time duration must not be negative
+             0;
+        Val -> Val
+    end.
 
 %%----------------------------------------------------------------------
 %% Func: chop/1
@@ -147,8 +154,17 @@ init_seed(A) when is_integer(A)->
     %% have the same seed, therefore, we need to know the id of the
     %% node to set a reproductible but different seed for each launcher.
     Id=get_node_id(),
-    ?LOGF("Seeding with ~p on node ~p~n",[Id,node()],?DEB),
-    random:seed(Id,Id,A);
+    ?DebugF("Seeding with ~p on node ~p~n",[Id,node()]),
+    random:seed(1000*Id,-1000*A*Id,1000*A*A);
+init_seed({A,B}) when is_integer(A) and is_integer(B)->
+    Id=get_node_id(),
+    ?DebugF("Seeding with ~p ~p ~p on node ~p~n",[A,B,Id,node()]),
+    %% init_seed with 2 args is called by ts_client, with increasing
+    %% values of A, and fixed B. If the seeds are too closed, the
+    %% initial pseudo random values will be quite closed to each
+    %% other. Trying to avoid this by using a multiplier big enough
+    %% (because the algorithm use mod 30XXX , see random.erl).
+    random:seed(1000*A*A,-1000*B*B,1000*Id*Id);
 init_seed({A,B,C}) ->
     random:seed(A,B,C).
 
@@ -237,12 +253,6 @@ mkey1search(List, Key) ->
         Results -> lists:reverse(Results)
     end.
 
-%% close socket if it exists
-close_socket(_Protocol, none) -> ok;
-close_socket(gen_tcp, Socket)-> gen_tcp:close(Socket);
-close_socket(ssl, Socket)    -> ssl:close(Socket);
-close_socket(gen_udp, Socket)-> gen_udp:close(Socket).
-
 %%----------------------------------------------------------------------
 %% datestr/0
 %% Purpose: print date as a string 'YYYYMMDD-HHMM'
@@ -288,6 +298,12 @@ erl_system_args(extended)->
                    " -kernel inetrc '"++ InetRcFile ++ "'" ;
                _ -> " "
            end,
+    Proto = case init:get_argument(proto_dist) of
+                {ok,[["inet6_tcp"]]}->
+                    ?LOG("IPv6 used for erlang distribution~n",?NOTICE),
+                   " -proto_dist inet6_tcp " ;
+               _ -> " "
+           end,
     ListenMin = case application:get_env(kernel,inet_dist_listen_min) of
                     undefined -> "";
                     {ok, Min} -> " -kernel inet_dist_listen_min " ++ integer_to_list(Min)++ " "
@@ -302,7 +318,7 @@ erl_system_args(extended)->
               "5.3" ++ _Tail     -> " +Mea r10b ";
               _ -> " "
           end,
-    lists:append([BasicArgs, Shared, Hybrid, Smp, Mea, Inet, Threads,ProcessMax,ListenMin,ListenMax]).
+    lists:append([BasicArgs, Shared, Hybrid, Smp, Mea, Inet, Proto, Threads,ProcessMax,ListenMin,ListenMax]).
 
 %%----------------------------------------------------------------------
 %% setsubdir/1
@@ -425,8 +441,8 @@ to_https({url, "http://-"++Rest})-> "https://" ++ Rest;
 to_https({url, URL})-> URL;
 to_https({request, {body,Data}}) when is_list(Data) ->
     %% body request, no headers
-    re:replace(Data,"http://-","https://",[global]);
-to_https({request, S="CONNECT"++Rest}) -> {ok,S};
+    {ok, re:replace(Data,"http://-","https://",[global])};
+to_https({request, S="CONNECT"++_Rest}) -> {ok,S};
 to_https({request, []}) -> {ok, []};
 to_https({request, String}) when is_list(String) ->
     EndOfHeader = string:str(String, "\r\n\r\n"),
@@ -434,8 +450,8 @@ to_https({request, String}) when is_list(String) ->
     Body = string:substr(String, EndOfHeader + 4),
     ReOpts=[global,{return,list}],
     TmpHeader = re:replace(Header,"http://-","https://",ReOpts),
-    TmpHeader2 = re:replace(TmpHeader,"Accept-Encoding: [0-9,a-zA-Z_ ]+\r\n","",ReOpts),
-    RealHeader = re:replace(TmpHeader2,"Host: -","Host: ",ReOpts),
+    TmpHeader2 = re:replace(TmpHeader,"Accept-Encoding: [0-9,a-z_ ]+\r\n","",ReOpts++[caseless]),
+    RealHeader = re:replace(TmpHeader2,"Host: -","Host: ",ReOpts++[caseless]),
     RealBody = re:replace(Body,"http://-","https://",ReOpts),
     RealString = RealHeader++  "\r\n" ++ RealBody,
     {ok, RealString}.
@@ -470,8 +486,12 @@ join(Sep, List) when is_list(List)->
     string:join(lists:map(ToStr,List), Sep).
 
 %% split a string given a string (at first occurence of char)
-split(String,Chr) ->
-    re:split(String,Chr,[{return,list}]).
+split(String,Chr) when is_list(String), is_list(Chr) ->
+    re:split(String,Chr,[{return,list}]);
+
+split(String,Chr) when is_binary(String), is_binary(Chr) ->
+    binary:split(String,[Chr],[global]).
+
 
 %% split a string given a char (faster)
 splitchar(String,Chr) ->
@@ -525,6 +545,8 @@ spawn_par(Fun, PidFrom, Args) ->
 %%----------------------------------------------------------------------
 inet_setopts(_, none, _) -> %socket was closed before
     none;
+inet_setopts(ssl6, Socket, Opts) ->
+    inet_setopts(ssl, Socket, Opts);
 inet_setopts(ssl, Socket, Opts) ->
     case ssl:setopts(Socket, Opts) of
         ok ->
@@ -535,6 +557,10 @@ inet_setopts(ssl, Socket, Opts) ->
             ?LOGF("Error while setting ssl options ~p ~p ~n", [Opts, Error], ?ERR),
             none
     end;
+inet_setopts(gen_tcp6, Socket,  Opts)->
+    inet_setopts(gen_tcp, Socket,  Opts);
+inet_setopts(gen_udp6, Socket,  Opts)->
+    inet_setopts(gen_udp, Socket,  Opts);
 inet_setopts(_Type, Socket,  Opts)->
     case inet:setopts(Socket, Opts) of
         ok ->
@@ -652,6 +678,19 @@ urandomstr_noflat(Size)  when is_integer(Size), Size >= 0 ->
     lists:nthtail(?DUPSTR_SIZE-Size, ?DUPSTR).
 
 %%----------------------------------------------------------------------
+%% @spec urandombinstr(Size::integer()) ->binary()
+%% @doc same as urandomstr/1, but returns a binary.
+%% @end
+%%----------------------------------------------------------------------
+urandombinstr(Size) when is_integer(Size) , Size >= ?DUPBINSTR_SIZE ->
+    Loop = Size div ?DUPBINSTR_SIZE,
+    Rest = Size rem ?DUPBINSTR_SIZE,
+    Res=lists:foldl(fun(_X,Acc)-> <<Acc/binary, ?DUPBINSTR/binary>> end, << >>,lists:seq(1,Loop)),
+    << Res/binary, ?DUPBINSTR:Rest/binary>>;
+urandombinstr(Size) when is_integer(Size), Size >= 0 ->
+    <<?DUPBINSTR:Size/binary>> .
+
+%%----------------------------------------------------------------------
 %% @spec urandomstr(Size::integer()) ->string()
 %% @doc same as urandomstr_noflat/1, but returns a flat list.
 %% @end
@@ -666,6 +705,19 @@ urandomstr(Size) when is_integer(Size), Size >= 0 ->
 %%----------------------------------------------------------------------
 randomstr(Size) when is_integer(Size), Size >= 0 ->
      lists:map(fun (_) -> random:uniform(25) + $a  end, lists:seq(1,Size)).
+
+%%----------------------------------------------------------------------
+%% @spec randombinstr(Size::integer()) ->binary()
+%% @doc returns a random binary string. slow if Size is high.
+%% @end
+%%----------------------------------------------------------------------
+randombinstr(0) -> <<>>;
+randombinstr(Size) when is_integer(Size), Size > 0 ->
+    randombinstr(Size,<<>>).
+randombinstr(0,Bin) -> Bin;
+randombinstr(Size,Bin) ->
+    C=random:uniform(25)+$a,
+    randombinstr(Size-1, << Bin/binary, C >>).
 
 
 %%----------------------------------------------------------------------
@@ -744,10 +796,14 @@ jsonpath(JSONPath,JSON) ->
     json_get_bin(Keys,JSON).
 json_get_bin([],Val) ->
     Val;
-json_get_bin([Key|Keys],undefined) ->
+json_get_bin([_Key|_Keys],undefined) ->
     undefined;
 json_get_bin([N|Keys],L) when is_integer(N), N =< length(L) ->
     Val =  lists:nth(N,L),
+    json_get_bin(Keys,Val);
+json_get_bin([N|Keys], L) when N =:= <<"*">>, is_list(L) ->
+    lists:map(fun(A) -> json_get_bin(Keys,A) end, L);
+json_get_bin([N|Keys],Val) when N =:= <<"*">> ->
     json_get_bin(Keys,Val);
 json_get_bin([<<"?",Expr/binary>> | Keys],L) when  is_list(L) ->
     case string:tokens(binary_to_list(Expr),"=") of

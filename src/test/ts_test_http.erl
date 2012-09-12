@@ -27,9 +27,30 @@
 
 -include("ts_profile.hrl").
 -include("ts_http.hrl").
+-include("ts_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 test()->ok.
+
+ipv6_url_test() ->
+    URL=ts_config_http:parse_URL("http://[2178:2:5:0:28f:0:3]:8080/toto.php?titi=[43]"),
+    ?assertMatch(#url{path="/toto.php",port=8080,host="2178:2:5:0:28f:0:3",scheme=http}, URL).
+
+ipv6_url2_test() ->
+    S=ts_config_http:server_to_url(#server{host="2178:2:5:0:28f:0:3",port=80,type=gen_tcp} ),
+    ?assertEqual("http://[2178:2:5:0:28f:0:3]", S).
+
+ipv6_url3_test() ->
+    S=ts_config_http:server_to_url(#server{host="[2178:2:5:0:28f:0:3]",port=80,type=gen_tcp} ),
+    ?assertEqual("http://[2178:2:5:0:28f:0:3]", S).
+
+ipv6_url4_test() ->
+    S=ts_config_http:server_to_url(#server{host="2178:2:5:0:28f:0:3",port=8080,type=gen_tcp} ),
+    ?assertEqual("http://[2178:2:5:0:28f:0:3]:8080", S).
+
+ipv4_url_test() ->
+    URL=ts_config_http:parse_URL("http://127.0.0.1:8080/"),
+    ?assertMatch(#url{path="/",port=8080,host="127.0.0.1",scheme=http}, URL).
 
 subst_url_test() ->
     DynVars=ts_dynvars:new('image', "/images/my image with spaces.png"),
@@ -41,12 +62,38 @@ subst_redirect_test()->
     URL="%%_redirect%%",
     Cookie="toto=bar; path=/; domain=erlang.org",
     Cookies=ts_http_common:add_new_cookie(Cookie,"erlang.org",[]),
-    Proto=#http_dyndata{cookies=Cookies,user_agent="Firefox"},
+    Proto=#http{session_cookies=Cookies,user_agent="Firefox"},
     DynVars=ts_dynvars:new(redirect,"http://erlang.org/bidule/truc"),
-    {Req,_}=ts_http:add_dynparams(true,#dyndata{proto=Proto,dynvars=DynVars},
+    {Req,_}=ts_http:add_dynparams(true,{DynVars, Proto} ,
                                   #http_request{url=URL},
-                                  {"erlang.org",80}),
+                                  {"erlang.org",80,gen_tcp}),
     Str="GET /bidule/truc HTTP/1.1\r\nHost: erlang.org\r\nUser-Agent: Firefox\r\nCookie: toto=bar\r\n\r\n",
+    {Res,_}=ts_http:get_message(Req,#state_rcv{}),
+    ?assertEqual(Str, binary_to_list(Res)).
+
+subst_redirect_proto_test()->
+    myset_env(),
+    URL="%%_redirect%%",
+    Cookie="toto=bar; path=/; domain=erlang.org",
+    Cookies=ts_http_common:add_new_cookie(Cookie,"erlang.org",[]),
+    Proto=#http{session_cookies=Cookies,user_agent="Firefox"},
+    DynVars=ts_dynvars:new(redirect,"http://erlang.org/bidule/truc"),
+    Rep=ts_http:add_dynparams(true,{DynVars, Proto},
+                                  #http_request{url=URL},
+                                  {"erlang.org",80,gen_tcp6}),
+    ?assertMatch({_,{"erlang.org",80,ts_tcp6}}, Rep).
+
+subst_cookie_test()->
+    myset_env(),
+    URL="/bidule/truc",
+    Cookie="bar=%%_foovar%%; path=/; domain=erlang.org",
+    Cookies=ts_http_common:add_new_cookie(Cookie,"erlang.org",[]),
+    Proto=#http{user_agent="Firefox"},
+    DynVars=ts_dynvars:new(foovar,"foo"),
+    Req=ts_http:add_dynparams(true,{DynVars, Proto},
+                                  #http_request{url=URL,cookie=Cookies},
+                                  {"erlang.org",80,gen_tcp}),
+    Str="GET /bidule/truc HTTP/1.1\r\nHost: erlang.org\r\nUser-Agent: Firefox\r\nCookie: bar=foo\r\n\r\n",
     {Res,_}=ts_http:get_message(Req,#state_rcv{}),
     ?assertEqual(Str, binary_to_list(Res)).
 
@@ -55,12 +102,12 @@ cookie_subdomain_test()->
     URL="/bidule/truc",
     Cookie="toto=bar; path=/; domain=.domain.org",
     Cookies=ts_http_common:add_new_cookie(Cookie,"domain.org",[]),
-    Proto=#http_dyndata{cookies=Cookies,user_agent="Firefox"},
+    Proto=#http{session_cookies=Cookies,user_agent="Firefox"},
     DynVars=ts_dynvars:new(),
-    Req=ts_http:add_dynparams(false,#dyndata{proto=Proto,dynvars=DynVars},
+    Req=ts_http:add_dynparams(false,{DynVars, Proto},
                                   #http_request{url=URL},
-                                  {"www.domain.org",80}),
-    Str="GET /bidule/truc HTTP/1.1\r\nHost: www.domain.org:80\r\nUser-Agent: Firefox\r\nCookie: toto=bar\r\n\r\n",
+                                  {"www.domain.org",80,gen_tcp}),
+    Str="GET /bidule/truc HTTP/1.1\r\nHost: www.domain.org\r\nUser-Agent: Firefox\r\nCookie: toto=bar\r\n\r\n",
     {Res,_}=ts_http:get_message(Req,#state_rcv{}),
     ?assertEqual(Str, binary_to_list(Res)).
 
@@ -69,12 +116,12 @@ cookie_dotdomain_test()->
     URL="/bidule/truc",
     Cookie="toto=bar; path=/; domain=.www.domain.org",
     Cookies=ts_http_common:add_new_cookie(Cookie,"www.domain.org",[]),
-    Proto=#http_dyndata{cookies=Cookies,user_agent="Firefox"},
+    Proto=#http{session_cookies=Cookies,user_agent="Firefox"},
     DynVars=ts_dynvars:new(),
-    Req=ts_http:add_dynparams(false,#dyndata{proto=Proto,dynvars=DynVars},
+    Req=ts_http:add_dynparams(false,{DynVars, Proto},
                                   #http_request{url=URL},
-                                  {"www.domain.org",80}),
-    Str="GET /bidule/truc HTTP/1.1\r\nHost: www.domain.org:80\r\nUser-Agent: Firefox\r\nCookie: toto=bar\r\n\r\n",
+                                  {"www.domain.org",80, gen_tcp}),
+    Str="GET /bidule/truc HTTP/1.1\r\nHost: www.domain.org\r\nUser-Agent: Firefox\r\nCookie: toto=bar\r\n\r\n",
     {Res,_}=ts_http:get_message(Req,#state_rcv{}),
     ?assertEqual(Str, binary_to_list(Res)).
 
@@ -134,12 +181,12 @@ add_cookie_samekey_nodomain_req_test()->
     Cookie2="RMID=42; path=/; domain=.foobar.net",
     Cookies1=ts_http_common:add_new_cookie(Cookie1,"",[]),
     Cookies = ts_http_common:add_new_cookie(Cookie2,"",Cookies1),
-    Proto=#http_dyndata{cookies=Cookies,user_agent="Firefox"},
+    Proto=#http{session_cookies=Cookies,user_agent="Firefox"},
     DynVars=ts_dynvars:new(),
-    Req=ts_http:add_dynparams(false,#dyndata{proto=Proto,dynvars=DynVars},
+    Req=ts_http:add_dynparams(false,{DynVars, Proto},
                                   #http_request{url=URL},
-                                  {"www.foobar.net",80}),
-    Str="GET /bidule/truc HTTP/1.1\r\nHost: www.foobar.net:80\r\nUser-Agent: Firefox\r\nCookie: RMID=42\r\n\r\n",
+                                  {"www.foobar.net",80, gen_tcp}),
+    Str="GET /bidule/truc HTTP/1.1\r\nHost: www.foobar.net\r\nUser-Agent: Firefox\r\nCookie: RMID=42\r\n\r\n",
     {Res,_}=ts_http:get_message(Req,#state_rcv{}),
     ?assertEqual(Str, binary_to_list(Res)).
 
@@ -155,6 +202,12 @@ chunk_header_ok3_test()->
 chunk_header_bad_test()->
     Rep=ts_http_common:parse_line("transfer-encoding: cheddar\r\n",#http{},[]),
     ?assertMatch(#http{chunk_toread=-1}, Rep).
+
+parse_304_test() ->
+    Res = <<"HTTP/1.1 304 Not Modified\r\nDate: Fri, 24 Aug 2012 07:49:37 GMT\r\nServer: Apache/2.2.16 (Debian)\r\nETag: \"201ad-10fb-473ae23fb0600\"\r\nVary: Accept-Encoding\r\n\r\n">>,
+    State=#state_rcv{session=#http{user_agent="Firefox"}},
+    {Rep, [], false } =ts_http:parse(Res,State),
+    ?assertMatch(#http{user_agent="Firefox",status={none,304}, partial=false}, Rep#state_rcv.session).
 
 split_body_test() ->
     Data = << "HTTP header\r\nHeader: value\r\n\r\nbody\r\n" >>,
@@ -187,6 +240,31 @@ compress_chunk_test()->
     Data3= <<"0\r\n\r\n" >>,
     Data= <<Data1/binary, A/binary, Data2/binary, B/binary, Data3/binary>>,
     ?assertEqual(<< "HTTP header\r\nHeader: value\r\nTransfer-Encoding: chunked\r\n\r\nsesame ouvre toi" >>, ts_http:decode_buffer(Data, #http{chunk_toread=-2, compressed={false,gzip}})).
+
+authentication_basic_test()->
+    Base="QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+    ?assertEqual(["Authorization: Basic ",Base,?CRLF], ts_http_common:authenticate(#http_request{userid="Aladdin", auth_type="basic",passwd="open sesame"})).
+
+authentication_digest1_test()->
+    OK="Authorization: Digest username=\"Mufasa\", realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", uri=\"/dir/index.html\", response=\"6629fae49393a05397450978507c4ef1\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\", qop=\"auth\", nc=00000001, cnonce=\"0a4f113b\"\r\n",
+
+    Req=#http_request{userid="Mufasa", auth_type="digest",passwd="Circle Of Life",
+                      realm ="testrealm@host.com", url="/dir/index.html",
+                      digest_qop    = "auth",
+                      digest_nonce  = "dcd98b7102dd2f0e8b11d0f600bfb0c093",
+                      digest_nc = "00000001",
+                      digest_cnonce = "0a4f113b",
+                      digest_opaque = "5ccc069c403ebaf9f0171e9517f40e41"},
+    ?assertEqual(OK, lists:flatten(ts_http_common:authenticate(Req))).
+
+
+oauth_test()->
+    myset_env(),
+    Data = <<"HTTP/1.1 200 OK\r\nDate: Mon, 10 Sep 2012 12:26:35 GMT\r\nServer: Apache/2.2.17 (Debian)\r\nX-Powered-By: PHP/5.3.3-7\r\nContent-Length: 55\r\nContent-Type: text/html\r\n\r\noauth_token=requestkey&oauth_token_secret=requestsecret">>,
+
+    ?assertMatch([{'token',<< "requestsecret" >>}], ts_search:parse_dynvar([{re,'token', "oauth_token_secret=([^&]*)"} ],Data)),
+    ?assertMatch([{'token',<< "requestkey" >>}], ts_search:parse_dynvar([{re,'token', "oauth_token=([^&]*)"} ],Data)).
+
 
  myset_env()->
     myset_env(0).

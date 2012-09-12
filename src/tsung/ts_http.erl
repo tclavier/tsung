@@ -28,11 +28,11 @@
 
 -behavior(ts_plugin).
 
+-include("ts_macros.hrl").
 -include("ts_profile.hrl").
 -include("ts_http.hrl").
 
--export([init_dynparams/0,
-         add_dynparams/4,
+-export([add_dynparams/4,
          get_message/2,
          session_defaults/0,
          dump/2,
@@ -58,7 +58,8 @@ session_defaults() ->
 %% Returns: record or []
 %%----------------------------------------------------------------------
 new_session() ->
-    #http{}.
+    UserAgent = ts_session_cache:get_user_agent(),
+    #http{user_agent=UserAgent}.
 
 %% @spec decode_buffer(Buffer::binary(),Session::record(http)) ->  NewBuffer::binary()
 %% @doc We need to decode buffer (remove chunks, decompress ...) for
@@ -157,63 +158,66 @@ parse_config(Element, Conf) ->
 %% Function: add_dynparams/4
 %% Purpose: add dynamic parameters to build the message
 %%          this is used for ex. for Cookies in HTTP
-%% Args: Subst (true|false), DynData = #dyndata, Param = #http_request,
+%% Args: Subst (true|false), {DynVars = #dynvars, #http_session}, Param = #http_request,
 %%                                               HostData  = {Hostname, Port}
 %% Returns: #http_request or { #http_request, {Host, Port, Scheme}}
 %%----------------------------------------------------------------------
-add_dynparams(false, DynData, Param, HostData) ->
-    add_dynparams(DynData#dyndata.proto, Param, HostData);
-add_dynparams(true, DynData, OldReq=#http_request{url=OldUrl}, HostData) ->
-    Req = subst(OldReq, DynData#dyndata.dynvars),
+add_dynparams(false, {_DynVars, Session}, Param, HostData) ->
+    add_dynparams(Session, Param, HostData);
+add_dynparams(true,  {DynVars, Session}, OldReq=#http_request{url=OldUrl}, HostData={_PrevHost, _PrevPort, PrevProto}) ->
+    Req = subst(OldReq, DynVars),
     case Req#http_request.url of
         OldUrl ->
-            add_dynparams(DynData#dyndata.proto,Req, HostData);
+            add_dynparams(Session,Req, HostData);
         "http" ++ Rest -> % URL has changed and is absolute
             URL=ts_config_http:parse_URL(Req#http_request.url),
-            ?DebugF("URL dynamic subst: ~p~n",[URL]),
+            ?LOGF("URL dynamic subst: ~p~n",[URL],?INFO),
             NewPort = ts_config_http:set_port(URL),
-            NewReq  = add_dynparams(DynData#dyndata.proto,
+            NewReq  = add_dynparams(Session,
                                     Req#http_request{host_header=undefined},
-                                    {URL#url.host, NewPort, URL#url.scheme}), % add scheme
+                                    {URL#url.host, NewPort, PrevProto, URL#url.scheme}), % add scheme
             case OldUrl of
                 "http"++_ -> % old url absolute: useproxy must be true
                     NewReq#http_request{url="http"++Rest};
                 _ ->
                     NewUrl=ts_config_http:set_query(URL),
-                    {NewReq#http_request{url=NewUrl}, {URL#url.host, NewPort,ts_config_http:set_scheme(URL#url.scheme)}}
+                    {NewReq#http_request{url=NewUrl}, {URL#url.host, NewPort,ts_config_http:set_scheme({URL#url.scheme,PrevProto})}}
                 end;
         _ -> % Same host:port
-            add_dynparams(DynData#dyndata.proto, Req, HostData)
+            add_dynparams(Session, Req, HostData)
     end.
 
 %% Function: add_dynparams/3
-add_dynparams(DynData,Param=#http_request{host_header=undefined}, HostData )->
+add_dynparams(Session,Param=#http_request{host_header=undefined}, HostData )->
     Header = case HostData of
-                 {Host,80, http}->
+                 {Host,80, _,http}->
                      Host;
-                 {Host,443, https}->
+                 {Host,443,_,https}->
                      Host;
-                 {Host,Port,_} ->
+                 {Host,80,   gen_tcp}->
+                     Host;
+                 {Host,443,  ssl}->
+                     Host;
+                 {Host,80,   gen_tcp6}->
+                     Host;
+                 {Host,443,  ssl6}->
+                     Host;
+                 {Host,Port,_,_} ->
                      Host++":"++ integer_to_list(Port);
-                 {Host,Port} ->
+                 {Host,Port,_Proto} ->
                      Host++":"++ integer_to_list(Port)
              end,
     ?DebugF("set host header dynamically: ~s~n",[Header]),
-    add_dynparams(DynData, Param#http_request{host_header=Header},HostData);
+    add_dynparams(Session, Param#http_request{host_header=Header},HostData);
 %% no cookies
-add_dynparams(#http_dyndata{cookies=[],user_agent=UA},Param, _) ->
+add_dynparams(#http{session_cookies=[],user_agent=UA},Param, _) ->
     Param#http_request{user_agent=UA};
 %% cookies
-add_dynparams(#http_dyndata{cookies=DynCookie,user_agent=UA}, Req, _) ->
+add_dynparams(#http{session_cookies=DynCookie,user_agent=UA}, Req, _) ->
     %% FIXME: should we use the Port value in the Cookie ?
     Cookie=DynCookie++Req#http_request.cookie,
     Req#http_request{cookie=Cookie,user_agent=UA}.
 
-init_dynparams() ->
-    %% FIXME: optimization: suppress this call if we don't need
-    %% customised users agents
-    UserAgent = ts_session_cache:get_user_agent(),
-    #dyndata{proto=#http_dyndata{user_agent=UserAgent}}.
 
 
 %%----------------------------------------------------------------------
@@ -224,14 +228,31 @@ init_dynparams() ->
 %%          request parameters.
 %% @end
 %%----------------------------------------------------------------------
-subst(Req=#http_request{url=URL, body=Body, headers = Headers, userid=UserId, passwd=Passwd}, DynData) ->
-    Req#http_request{url = escape_url(ts_search:subst(URL, DynData)),
-             body   = ts_search:subst(Body, DynData),
+subst(Req=#http_request{url=URL, body=Body, headers = Headers, oauth_url=OUrl,
+                        oauth_access_token=AToken, oauth_access_secret=ASecret,digest_qop = QOP,
+                        digest_cnonce=CNonce, digest_nc=Nc,digest_nonce=Nonce, digest_opaque=Opaque,
+                        realm=Realm, userid=UserId, passwd=Passwd, cookie = Cookies}, DynVars) ->
+    Req#http_request{url =  escape_url(ts_search:subst(URL, DynVars)),
+             body   = ts_search:subst(Body, DynVars),
              headers = lists:foldl(fun ({Name, Value}, Result) ->
-                                           [{Name, ts_search:subst(Value, DynData)} | Result]
+                                           [{Name, ts_search:subst(Value, DynVars)} | Result]
                                    end, [], Headers),
-             userid = ts_search:subst(UserId, DynData),
-             passwd = ts_search:subst(Passwd, DynData)}.
+             oauth_access_token = ts_search:subst(AToken, DynVars),
+             digest_nonce  = ts_search:subst(Nonce, DynVars),
+             digest_cnonce = ts_search:subst(CNonce, DynVars),
+             digest_nc     = ts_search:subst(Nc, DynVars),
+             digest_opaque = ts_search:subst(Opaque, DynVars),
+             digest_qop    = ts_search:subst(QOP, DynVars),
+             realm         = ts_search:subst(Realm, DynVars),
+             oauth_access_secret = ts_search:subst(ASecret, DynVars),
+             oauth_url = ts_search:subst(OUrl, DynVars),
+             cookie = lists:foldl(
+                        fun (#cookie{ value = Value } = C, Result) ->
+                            [C#cookie{ value = ts_search:subst(Value, DynVars) }
+                             | Result]
+                        end, [], Cookies),
+             userid = ts_search:subst(UserId, DynVars),
+             passwd = ts_search:subst(Passwd, DynVars)}.
 
 %% URL substitution, we must escape some characters
 %% currently, we only handle space conversion to %20

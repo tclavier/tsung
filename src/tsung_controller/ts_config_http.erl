@@ -36,7 +36,7 @@
 -include("ts_profile.hrl").
 -include("ts_http.hrl").
 -include("ts_config.hrl").
-
+ 
 -include("xmerl.hrl").
 
 %%----------------------------------------------------------------------
@@ -49,7 +49,7 @@
 parse_config(Element = #xmlElement{name=dyn_variable}, Conf = #config{}) ->
     ts_config:parse(Element,Conf);
 parse_config(Element = #xmlElement{name=http},
-             Config=#config{curid = Id, session_tab = Tab, servers = Servers,
+             Config=#config{curid = Id, session_tab = Tab, servers = [Server|_] = Servers,
                             sessions = [CurS | _], dynvar=DynVar,
                             subst    = SubstFlag, match=MatchRegExp}) ->
     Version  = ts_config:getAttr(string,Element#xmlElement.attributes, version, "1.1"),
@@ -96,17 +96,70 @@ parse_config(Element = #xmlElement{name=http},
                             Request2#http_request.headers),
     Request3 = Request2#http_request{headers=Headers,cookie=Cookies},
     %% HTTP Authentication
-    Msg = case lists:keysearch(www_authenticate, #xmlElement.name,
+    Request4 = case lists:keysearch(www_authenticate, #xmlElement.name,
                                Element#xmlElement.content) of
               {value, AuthEl=#xmlElement{} } ->
                   UserId= ts_config:getAttr(string,AuthEl#xmlElement.attributes,
                                               userid, undefined),
+                  Type = ts_config:getAttr(string,AuthEl#xmlElement.attributes,
+                                              type, "basic"),
+                  Nonce = ts_config:getAttr(string,AuthEl#xmlElement.attributes,
+                                              nonce, undefined),
+                  Opaque = ts_config:getAttr(string,AuthEl#xmlElement.attributes,
+                                              opaque, undefined),
+                  Cnonce = ts_config:getAttr(string,AuthEl#xmlElement.attributes,
+                                                cnonce, "%%ts_user_server:get_really_unique_id%%"),
+                  Nc = ts_config:getAttr(string,AuthEl#xmlElement.attributes,
+                                              nc, "00000001"),
                   Passwd= ts_config:getAttr(string,AuthEl#xmlElement.attributes,
                                               passwd, undefined),
-                  NewReq=Request3#http_request{userid=UserId, passwd=Passwd},
+                  Realm = ts_config:getAttr(string,AuthEl#xmlElement.attributes,
+                                              realm, undefined),
+                  ?LOGF("DIGEST ? : ~p ~p ~p", [Type, Nonce, Realm], ?WARN),
+                  Request3#http_request{userid=UserId, passwd=Passwd, 
+                                        auth_type=Type, digest_nonce=Nonce,
+                                        digest_cnonce=Cnonce, digest_nc=Nc, 
+                                        digest_opaque=Opaque, realm=Realm};
+              _ ->
+                  Request3
+          end,
+    %% OAuth
+    Msg = case lists:keysearch(oauth, #xmlElement.name,
+                               Element#xmlElement.content) of
+              {value, AuthEl2=#xmlElement{} } ->
+                  ConsumerKey = ts_config:getAttr(string,AuthEl2#xmlElement.attributes,
+                                              consumer_key, undefined),
+                  ConsumerSecret = ts_config:getAttr(string,AuthEl2#xmlElement.attributes,
+                                              consumer_secret, undefined),
+                  AccessToken = ts_config:getAttr(string,AuthEl2#xmlElement.attributes,
+                                              access_token, []),
+                  AccessTokenSecret = ts_config:getAttr(string,AuthEl2#xmlElement.attributes,
+                                              access_token_secret, []),
+                  Encoding = ts_config:getAttr(string,AuthEl2#xmlElement.attributes,
+                                              encoding, "HMAC-SHA1"),
+                  AbsoluteURL = case URL of
+                    "http" ++ _Rest ->
+                      hd(string:tokens(URL, "?"));
+                    _Relative ->
+                      server_to_url(Server) ++ hd(string:tokens(URL, "?"))
+                  end,
+                  SigEncoding = case Encoding of
+                    "PLAINTEXT" ->
+                      plaintext;
+                    "HMAC-SHA1" ->
+                      hmac_sha1;
+                    "RSA-SHA1" ->
+                      rsa_sha1
+                  end, 
+                NewReq=Request4#http_request{oauth_access_token=AccessToken,
+                                             oauth_url=AbsoluteURL,
+                                             oauth_access_secret=AccessTokenSecret,
+                                             oauth_consumer={ConsumerKey,
+                                                            ConsumerSecret,
+                                                            SigEncoding}},
                   set_msg(NewReq, {SubstFlag, MatchRegExp, UseProxy, Servers, PreviousHTTPServer, Tab, CurS#session.id} );
               _ ->
-                  set_msg(Request3, {SubstFlag, MatchRegExp, UseProxy, Servers, PreviousHTTPServer, Tab, CurS#session.id} )
+                  set_msg(Request4, {SubstFlag, MatchRegExp, UseProxy, Servers, PreviousHTTPServer, Tab, CurS#session.id} )
           end,
     ts_config:mark_prev_req(Id-1, Tab, CurS),
     ets:insert(Tab,{{CurS#session.id, Id},Msg#ts_request{endpage=true,
@@ -192,7 +245,7 @@ set_msg(HTTP=#http_request{url="http" ++ URL},
     Path       = set_query(URLrec),
     HostHeader = set_host_header(URLrec),
     Port       = set_port(URLrec),
-    Scheme     = set_scheme(URLrec#url.scheme),
+    Scheme     = set_scheme({URLrec#url.scheme,Server#server.type}),
     ets:insert(Tab,{{http_server, Id}, {HostHeader, URLrec#url.scheme}}),
 
     {RealServer, RealPath} = case UseProxy of
@@ -218,10 +271,10 @@ set_msg(HTTP=#http_request{url="%%" ++ _TailURL},  {true, MatchRegExp, _Proxy, _
     set_msg2(HTTP,
              #ts_request{ack = parse, subst = true, match = MatchRegExp });
 %% relative URL, no proxy, a single server => we can preset host header at configuration time
-set_msg(HTTPRequest, {SubstFlag, MatchRegExp, false, [Server], [],_Tab,_Id}) ->
-    ?LOG("Relative URL, single server ",?NOTICE),
+set_msg(HTTPRequest, Args={_SubstFlag, _MatchRegExp, false, [Server], [],_Tab,_Id}) ->
+    ?LOG("Relative URL, single server ",?INFO),
     URL = server_to_url(Server) ++ HTTPRequest#http_request.url,
-    set_msg(HTTPRequest#http_request{url=URL}, {SubstFlag, MatchRegExp, false, [Server], [],_Tab,_Id});
+    set_msg(HTTPRequest#http_request{url=URL}, Args);
 %% relative URL, no proxy, several servers: don't set host header
 %% since the real server will be choose at run time
 set_msg(HTTPRequest, {SubstFlag, MatchRegExp, false, _Servers, [],_Tab,_Id}) ->
@@ -241,22 +294,32 @@ set_msg(HTTPRequest, {SubstFlag, MatchRegExp, true, Server, {HostHeader, PrevSch
 %% Purpose: set param  in ts_request
 set_msg2(HTTPRequest, Msg) -> Msg#ts_request{ param = HTTPRequest }.
 
-server_to_url(#server{port=80, host= Host, type= gen_tcp})->
-    "http://" ++ Host;
-server_to_url(#server{port=Port, host= Host, type= gen_tcp})->
-    "http://" ++ Host ++ ":" ++ integer_to_list(Port);
-server_to_url(#server{port=443, host= Host, type= ssl})->
-    "https://" ++ Host;
-server_to_url(#server{port=Port, host= Host, type= ssl})->
-    "https://" ++ Host ++ ":" ++ integer_to_list(Port).
+server_to_url(#server{port=443, host= Host, type= Type}) when Type==ts_ssl orelse Type==ts_ssl6->
+    "https://" ++ encode_ipv6_address(Host);
+server_to_url(#server{port=Port, host= Host, type= Type})when Type==ts_ssl orelse Type==ts_ssl6->
+    "https://" ++ encode_ipv6_address(Host) ++ ":" ++ integer_to_list(Port);
+server_to_url(#server{port=80, host= Host})->
+    "http://" ++ encode_ipv6_address(Host);
+server_to_url(#server{port=Port, host= Host})->
+    "http://" ++ encode_ipv6_address(Host) ++ ":" ++ integer_to_list(Port).
 
 %%--------------------------------------------------------------------
 %% Func: set_host_header/1
 %%--------------------------------------------------------------------
 %% if port is undefined, don't need to set port, because it use the default (80 or 443)
-set_host_header(#url{host=Host,port=undefined})   -> Host;
+set_host_header(#url{host=Host,port=undefined}) -> encode_ipv6_address(Host);
 set_host_header(#url{host=Host,port=Port}) when is_integer(Port) ->
-    Host ++ ":" ++ integer_to_list(Port).
+    encode_ipv6_address(Host) ++ ":" ++ integer_to_list(Port).
+
+
+encode_ipv6_address(Host) when hd(Host)==$[ ->
+    %% ipv6; already using [] (rfc2732), no need to add
+    Host;
+encode_ipv6_address(Host)->
+    case string:chr(Host,$:) of
+        0 -> Host; % regular name or ipv4 address
+        _ ->  "["++Host++"]"
+    end.
 
 %%--------------------------------------------------------------------
 %% Func: set_port/1
@@ -268,8 +331,17 @@ set_port(#url{scheme=http,port=undefined})   -> 80;
 set_port(#url{port=Port}) when is_integer(Port) -> Port;
 set_port(#url{port=Port}) -> integer_to_list(Port).
 
-set_scheme(http)  -> gen_tcp;
-set_scheme(https) -> ssl.
+%% @spec set_scheme({http|https,gen_tcp|gen_tcp6|ssl|ssl6})-> gen_tcp|gen_tcp6|ssl|ssl6
+%% @doc set scheme for given protocol and server setup. If the main
+%% server is configured with IPv6, we assume that the we should also
+%% use IPv6 for the given absolut URL
+%% @end
+set_scheme({http, gen_tcp6}) -> ts_tcp6;
+set_scheme({http, ssl6})     -> ts_tcp6;
+set_scheme({http, _})        -> ts_tcp;
+set_scheme({https, ssl6})    -> ts_ssl6;
+set_scheme({https, gen_tcp6})-> ts_ssl6;
+set_scheme({https, _})       -> ts_ssl.
 
 
 set_query(URLrec = #url{querypart=""}) ->
@@ -299,6 +371,9 @@ parse_URL(String) when is_list(String) ->
 %% Returns: #url record
 %%----------------------------------------------------------------------
 % parse host
+parse_URL(host, [$[|Tail] , [], URL) -> % host starts with '[': ipv6 address in url
+    {match,[Host,Rest]} = re:run(Tail,"^([^\\]]*)\\](.*)",[{capture,all_but_first,list}]),
+    parse_URL(host, Rest, lists:reverse(Host), URL);
 parse_URL(host, [], Acc, URL) -> % no path or port
     URL#url{host=lists:reverse(Acc), path= "/"};
 parse_URL(host, [$/|Tail], Acc, URL) -> % path starts here
